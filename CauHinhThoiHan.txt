@@ -1,0 +1,11 @@
+# Thời hạn hiệu lực của giấy chứng nhận theo phương pháp thực hiện.
+# Mỗi dòng một quy định, dạng:  <Phương pháp thực hiện>|<số năm>
+# Ví dụ:  ĐLVN 30: 2019|2   nghĩa là phương pháp ĐLVN 30: 2019 có hạn 2 năm.
+# Muốn tính theo THÁNG thì thêm chữ t:  ĐLVN 01: 2019|18t  = 18 tháng.
+# Dòng bắt đầu bằng dấu # là ghi chú, chương trình bỏ qua.
+ĐLVN 30: 2019|2
+ĐLVN 16: 2021|2
+ĐLVN 39: 2019|3
+ĐLVN 14: 2009|1
+ĐLVN 15: 2009|1
+ĐLVN 01: 2019|18t

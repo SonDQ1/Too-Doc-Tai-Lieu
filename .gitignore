@@ -1,0 +1,32 @@
+# --- Kết quả build, không đưa lên kho mã ---
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# Bản đóng gói gửi khách (mỗi file ~42 MB)
+ThayTheDuLieu_v*.zip
+*.zip
+
+# --- Tài liệu THẬT của khách hàng: không đưa lên ---
+# (chứa tên đơn vị, tên hộ kinh doanh, số tem, số máy thật)
+tai liệu gốc/
+tài liệu cần chuyển đổi/
+ketqua/
+KetQua/
+Mẫu GCN Cường/
+Nam 2026/
+New1/
+New2/
+
+# Mọi file Excel/Word nằm rải rác ở thư mục gốc đều là dữ liệu khách
+/*.xlsx
+/*.xlsm
+/*.xls
+/*.docx
+/*.doc
+
+# File tạm của Office
+~$*
+*.tmp
