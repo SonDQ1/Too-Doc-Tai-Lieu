@@ -216,7 +216,7 @@ FIELD_ORDER = {f["key"]: i for i, f in enumerate(FIELDS)}
 # ---------------------------------------------------------------------------
 # Phiên bản chương trình — hiện trên thanh tiêu đề để biết đang dùng bản nào.
 # Mỗi lần bàn giao bản mới nhớ tăng số này.
-APP_VERSION = "20"
+APP_VERSION = "21"
 APP_DATE = "09/2026"
 APP_TITLE = "Công cụ tạo giấy chứng nhận kiểm định  —  bản %s (%s)" % (
     APP_VERSION, APP_DATE)
@@ -619,6 +619,44 @@ def template_start_number(path):
     return template_field_value(path, "so_gcn")
 
 
+_ADDRESS_WORD = (r"(?:xã|phường|thị\s+trấn|thị\s+xã|huyện|quận|tỉnh|"
+                 r"thành\s+phố|tp\.?|thôn|bản|ấp|tổ\s+dân\s+phố|tổ|"
+                 r"khu\s+phố|khu|đường|phố|số\s+nhà|ngõ|chợ)")
+_ADDR_CUT = re.compile(r",\s*" + _ADDRESS_WORD + r"\b", re.IGNORECASE)
+
+
+def _org_name(value):
+    """Tách tên đơn vị khỏi phần địa chỉ đi kèm.
+    'Trạm y tế Trấn Yên, xã Trấn Yên, tỉnh Lào Cai' -> 'Trạm y tế Trấn Yên'."""
+    text = (value or "").strip()
+    m = _ADDR_CUT.search(text)
+    return text[:m.start()].strip().rstrip(",").strip() if m else text
+
+
+def apply_user_fields(records, template_path=""):
+    """Dòng "Người/Đơn vị sử dụng" trên giấy chứng nhận thường CHỈ ghi tên đơn
+    vị, còn địa chỉ nằm ở dòng "Nơi sử dụng". Biên bản Excel lại ghi gộp cả
+    hai, làm dòng này dài quá khổ, xuống hàng và đẩy lệch phần cuối trang so
+    với các trang khác. Nếu mẫu Word đang theo lối chỉ ghi tên thì cắt bớt
+    địa chỉ cho khớp."""
+    tpl_value = template_field_value(template_path, "nguoi_sd")
+    if tpl_value and _ADDR_CUT.search(tpl_value):
+        return []          # mẫu vốn ghi cả địa chỉ -> giữ nguyên
+    count = 0
+    for r in records:
+        full = r.get("nguoi_sd")
+        if not full:
+            continue
+        short = _org_name(full)
+        if short and short != full:
+            r["nguoi_sd"] = short
+            count += 1
+    if not count:
+        return []
+    return ["Đã bỏ phần địa chỉ khỏi \"Người/Đơn vị sử dụng\" của %d giấy cho "
+            "khớp mẫu (địa chỉ vẫn giữ ở dòng \"Nơi sử dụng\")" % count]
+
+
 def apply_validity(records, template_path=""):
     """Tính 'Thời hạn đến' cho các bộ chưa có (Excel không ghi 'Hiệu lực đến').
 
@@ -777,6 +815,68 @@ def _is_empty_paragraph(el):
     return True
 
 
+def _chunk_leads_with_break(chunk):
+    """Khối này đã tự mở đầu bằng một ngắt trang chưa?"""
+    for el in chunk:
+        for x in el.iter():
+            if x.tag in (W + "drawing", W + "pict", W + "object") or \
+                    (x.tag == W + "t" and (x.text or "").strip()):
+                return False
+            if x.tag == W + "br" and x.get(W + "type") == "page":
+                return True
+    return False
+
+
+def _strip_trailing_page_breaks(chunk):
+    """Bỏ ngắt trang nằm SAU nội dung cuối của khối.
+
+    Nhiều mẫu kết thúc trang bằng một đoạn rỗng chứa ngắt trang. Khi nhân
+    bản, dấu kết đoạn ấy rơi xuống đầu trang kế, chiếm một dòng và làm lệch
+    bố cục trang đó."""
+    seq = [(el, x) for el in chunk for x in el.iter()]
+    last_content = -1
+    for i, (_el, x) in enumerate(seq):
+        if x.tag in (W + "drawing", W + "pict", W + "object") or \
+                (x.tag == W + "t" and (x.text or "").strip()):
+            last_content = i
+    removed = 0
+    for _el, x in seq[last_content + 1:]:
+        if x.tag == W + "br" and x.get(W + "type") == "page":
+            parent = x.getparent()
+            if parent is not None:
+                parent.remove(x)
+                removed += 1
+    return removed
+
+
+def _set_page_break_before(el):
+    """Đánh dấu đoạn văn này BẮT ĐẦU một trang mới (w:pageBreakBefore).
+
+    Không chèn ngắt trang vào cuối đoạn trước: khi đó dấu kết đoạn của đoạn
+    ấy rơi xuống đầu trang sau, chiếm mất một dòng trống và đẩy lệch toàn bộ
+    nội dung trang đó so với các trang khác."""
+    if el is None or el.tag != W + "p":
+        return False
+    pPr = el.find(W + "pPr")
+    if pPr is None:
+        pPr = etree.Element(W + "pPr")
+        el.insert(0, pPr)
+    if pPr.find(W + "pageBreakBefore") is not None:
+        return True
+    node = etree.Element(W + "pageBreakBefore")
+    # theo lược đồ OOXML, pageBreakBefore đứng sau pStyle/keepNext/keepLines
+    after = None
+    for tag in ("pStyle", "keepNext", "keepLines"):
+        found = pPr.find(W + tag)
+        if found is not None:
+            after = found
+    if after is not None:
+        after.addnext(node)
+    else:
+        pPr.insert(0, node)
+    return True
+
+
 def _make_page_break_para():
     p = etree.Element(W + "p")
     r = etree.SubElement(p, W + "r")
@@ -829,10 +929,9 @@ def _clone_last_page(root, starts, need):
         except ValueError:
             pass
     pos = end
+    chunks = [list(template)]
     for _ in range(n_clones):
-        if not has_separator:
-            body.insert(pos, _make_page_break_para())
-            pos += 1
+        current = []
         for el in template:
             cp = copy.deepcopy(el)
             for d in cp.iter(WP_DOCPR):
@@ -840,6 +939,16 @@ def _clone_last_page(root, starts, need):
                 d.set("id", str(max_id))
             body.insert(pos, cp)
             pos += 1
+            current.append(cp)
+        chunks.append(current)
+
+    # Chuẩn hoá cách sang trang: bỏ ngắt trang thừa ở cuối mỗi khối, rồi cho
+    # mỗi khối sau TỰ bắt đầu trang mới. Nhờ vậy mọi trang bắt đầu ở cùng một
+    # vị trí, không trang nào bị dôi ra một dòng trống ở đầu.
+    for i, chunk in enumerate(chunks):
+        _strip_trailing_page_breaks(chunk)
+        if i > 0 and not _chunk_leads_with_break(chunk):
+            _set_page_break_before(chunk[0])
 
 
 def _split_multi_page_paragraphs(root):
@@ -901,11 +1010,9 @@ def _split_multi_page_paragraphs(root):
             return False
 
         chain = [p] + new_ps
-        for par, nxt in zip(chain[:-1], chain[1:]):
+        for _par, nxt in zip(chain[:-1], chain[1:]):
             if not _leads_with_break(nxt):
-                r = etree.SubElement(par, W + "r")
-                br = etree.SubElement(r, W + "br")
-                br.set(W + "type", "page")
+                _set_page_break_before(nxt)
         for k, np in enumerate(new_ps):
             body.insert(pos + 1 + k, np)
         n_split += 1
@@ -2155,6 +2262,7 @@ def run_gui():
             # không nhập gì -> đánh số tiếp theo số đang có trong mẫu
             apply_auto_numbering(records,
                                  start_no or template_start_number(tpl_input))
+            notes.extend(apply_user_fields(records, tpl_input))
             notes.extend(apply_validity(records, tpl_input))
             pnotes = []
             total = 0
@@ -2283,6 +2391,7 @@ def run_cli_excel(folder, template, out, start_no=""):
             pass
     records, notes = collect_excel_records(folder)
     apply_auto_numbering(records, start_no or template_start_number(template))
+    notes.extend(apply_user_fields(records, template))
     notes.extend(apply_validity(records, template))
     print("Doc duoc %d bo du lieu" % len(records))
     for i, r in enumerate(records[:8], 1):
