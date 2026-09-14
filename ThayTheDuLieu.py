@@ -217,7 +217,7 @@ FIELD_ORDER = {f["key"]: i for i, f in enumerate(FIELDS)}
 # ---------------------------------------------------------------------------
 # Phiên bản chương trình — hiện trên thanh tiêu đề để biết đang dùng bản nào.
 # Mỗi lần bàn giao bản mới nhớ tăng số này.
-APP_VERSION = "23"
+APP_VERSION = "24"
 APP_DATE = "09/2026"
 APP_TITLE = "Công cụ tạo giấy chứng nhận kiểm định  —  bản %s (%s)" % (
     APP_VERSION, APP_DATE)
@@ -1708,7 +1708,40 @@ def natural_sort_key(path):
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
-def collect_excel_records(folder, progress=None):
+# cách sắp xếp file Excel: khoá = giá trị hiển thị trên giao diện
+SORT_MODES = [
+    ("ten", "Tên file (1, 2, … 10, 100)"),
+    ("sua", "Ngày sửa file (cũ → mới)"),
+    ("tao", "Ngày tạo file (cũ → mới)"),
+]
+
+
+def _sorted_excel_files(files, sort_by):
+    """Sắp danh sách file theo tên/ngày sửa/ngày tạo. Trả về (files, cảnh báo).
+
+    File chép từ nơi khác về thường có NGÀY TẠO giống hệt nhau (bằng lúc
+    chép), sắp theo mốc đó sẽ không có tác dụng — khi đó báo cho người dùng
+    biết thay vì im lặng cho ra thứ tự tuỳ tiện."""
+    if sort_by not in ("sua", "tao"):
+        return sorted(files, key=natural_sort_key), []
+    getter = os.path.getmtime if sort_by == "sua" else os.path.getctime
+    ten_moc = "ngày sửa" if sort_by == "sua" else "ngày tạo"
+    stamps = {}
+    for f in files:
+        try:
+            stamps[f] = getter(f)
+        except OSError:
+            stamps[f] = 0.0
+    notes = []
+    if len(files) > 1 and len({round(v) for v in stamps.values()}) == 1:
+        notes.append("Tất cả %d file có cùng %s (thường do chép về cùng lúc) "
+                     "— đã sắp theo tên file thay thế" % (len(files), ten_moc))
+        return sorted(files, key=natural_sort_key), notes
+    # cùng mốc thời gian thì xếp tiếp theo tên cho ổn định
+    return sorted(files, key=lambda f: (stamps[f], natural_sort_key(f))), notes
+
+
+def collect_excel_records(folder, progress=None, sort_by="ten"):
     """Duyệt đệ quy thư mục, đọc mọi file Excel (bỏ 'Bien ban giao...').
     progress(done, total, text) được gọi sau mỗi file để báo tiến độ.
     Trả về (records, notes)."""
@@ -1724,7 +1757,8 @@ def collect_excel_records(folder, progress=None):
                 continue
             if low.endswith((".xlsx", ".xlsm", ".xls")):
                 files.append(os.path.join(base, n))
-    files.sort(key=natural_sort_key)
+    files, sort_notes = _sorted_excel_files(files, sort_by)
+    notes.extend(sort_notes)
 
     for i, f in enumerate(files, 1):
         if progress:
@@ -2303,11 +2337,17 @@ def run_gui():
     make_row(tab2, 3, "Tên file xuất:", var_name2)
     ent_start2 = make_row(tab2, 4, "Số bắt đầu (N°):", var_start2,
                           hint=SO_GCN_HINT)
+    opt2 = ttk.Frame(tab2)
+    opt2.grid(row=5, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 4))
     ttk.Checkbutton(
-        tab2, variable=var_kdv2,
+        opt2, variable=var_kdv2,
         text="Cập nhật tên Kiểm định viên theo biên bản "
-             "(bỏ chọn thì giữ tên in sẵn trong mẫu)"
-    ).grid(row=5, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+             "(bỏ chọn thì giữ tên in sẵn trong mẫu)").pack(side="left")
+    ttk.Label(opt2, text="     Thứ tự trang:").pack(side="left")
+    cb_sort = ttk.Combobox(opt2, state="readonly", width=26,
+                           values=[nhan for _k, nhan in SORT_MODES])
+    cb_sort.current(0)
+    cb_sort.pack(side="left", padx=(4, 0))
     ent_start2.set_hint(template_start_number(var_tpl.get()))
 
     # hiển thị sẵn tên mẫu mặc định trên ô chọn
@@ -2369,13 +2409,14 @@ def run_gui():
         folder = var_folder.get()
         tpl_input = var_tpl.get()
         doi_kdv = bool(var_kdv2.get())
+        sort_by = SORT_MODES[max(cb_sort.current(), 0)][0]
         start_no = var_start2.get().strip()
         if start_no == ent_start2.hint_state["hint"]:
             start_no = ""   # khách chưa gõ gì, mới chỉ là chữ gợi ý mờ
 
         def worker(progress):
             progress(text="Đang quét thư mục Excel...")
-            records, notes = collect_excel_records(folder, progress)
+            records, notes = collect_excel_records(folder, progress, sort_by)
             if not records:
                 raise RuntimeError("Không đọc được bộ dữ liệu nào từ thư mục Excel.\n"
                                    + "\n".join(notes[:10]))
@@ -2506,7 +2547,7 @@ def run_cli(a, b, out, start_no=""):
     print("Da thay %d vi tri. Luu: %s" % (total, out))
 
 
-def run_cli_excel(folder, template, out, start_no=""):
+def run_cli_excel(folder, template, out, start_no="", sort_by="ten"):
     # bản exe chạy chế độ cửa sổ không có màn hình chữ -> ghi nhật ký ra
     # file <tên file xuất>.log để còn xem được khi cần đối chiếu
     if sys.stdout is None:
@@ -2519,7 +2560,7 @@ def run_cli_excel(folder, template, out, start_no=""):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    records, notes = collect_excel_records(folder)
+    records, notes = collect_excel_records(folder, sort_by=sort_by)
     apply_auto_numbering(records, start_no or template_start_number(template))
     notes.extend(apply_user_fields(records, template))
     notes.extend(apply_validity(records, template))
@@ -2564,17 +2605,20 @@ def run_cli_list_templates():
 if __name__ == "__main__":
     # tham số tuỳ chọn --so=400: đánh số giấy chứng nhận từ 400 tăng dần
     _start = ""
+    _sort = "ten"
     _args = []
     for _a in sys.argv[1:]:
         if _a.startswith("--so="):
             _start = _a[5:]
+        elif _a.startswith("--sapxep="):
+            _sort = _a[9:]
         else:
             _args.append(_a)
 
     if len(_args) == 1 and _args[0] == "--mau":
         run_cli_list_templates()
     elif len(_args) == 4 and _args[0] == "--excel":
-        run_cli_excel(_args[1], _args[2], _args[3], _start)
+        run_cli_excel(_args[1], _args[2], _args[3], _start, _sort)
     elif len(_args) == 3:
         run_cli(_args[0], _args[1], _args[2], _start)
     else:
