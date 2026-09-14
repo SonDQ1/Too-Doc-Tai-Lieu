@@ -217,7 +217,7 @@ FIELD_ORDER = {f["key"]: i for i, f in enumerate(FIELDS)}
 # ---------------------------------------------------------------------------
 # Phiên bản chương trình — hiện trên thanh tiêu đề để biết đang dùng bản nào.
 # Mỗi lần bàn giao bản mới nhớ tăng số này.
-APP_VERSION = "22"
+APP_VERSION = "23"
 APP_DATE = "09/2026"
 APP_TITLE = "Công cụ tạo giấy chứng nhận kiểm định  —  bản %s (%s)" % (
     APP_VERSION, APP_DATE)
@@ -1698,6 +1698,16 @@ def parse_excel_file(path):
         wb.close()
 
 
+def natural_sort_key(path):
+    """Khoá sắp xếp theo SỐ chứ không theo chữ.
+
+    Sắp theo chữ thì "100.xlsx" đứng trước "54.xlsx" (vì ký tự '1' < '5'),
+    làm thứ tự trang và số giấy chứng nhận lệch so với thứ tự biên bản.
+    Tách các cụm chữ số ra so sánh như số: 54 < 55 < 100 < 105."""
+    parts = re.split(r"(\d+)", str(path))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
 def collect_excel_records(folder, progress=None):
     """Duyệt đệ quy thư mục, đọc mọi file Excel (bỏ 'Bien ban giao...').
     progress(done, total, text) được gọi sau mỗi file để báo tiến độ.
@@ -1714,7 +1724,7 @@ def collect_excel_records(folder, progress=None):
                 continue
             if low.endswith((".xlsx", ".xlsm", ".xls")):
                 files.append(os.path.join(base, n))
-    files.sort()
+    files.sort(key=natural_sort_key)
 
     for i, f in enumerate(files, 1):
         if progress:
