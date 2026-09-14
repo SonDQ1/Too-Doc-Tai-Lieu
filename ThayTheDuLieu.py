@@ -21,6 +21,7 @@ import base64
 import io
 import os
 import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -216,7 +217,7 @@ FIELD_ORDER = {f["key"]: i for i, f in enumerate(FIELDS)}
 # ---------------------------------------------------------------------------
 # Phiên bản chương trình — hiện trên thanh tiêu đề để biết đang dùng bản nào.
 # Mỗi lần bàn giao bản mới nhớ tăng số này.
-APP_VERSION = "21"
+APP_VERSION = "22"
 APP_DATE = "09/2026"
 APP_TITLE = "Công cụ tạo giấy chứng nhận kiểm định  —  bản %s (%s)" % (
     APP_VERSION, APP_DATE)
@@ -246,6 +247,24 @@ TEMPLATES = [
     {"file": "Xquang.docx", "label": "Thiết bị X-quang", "ready": False},
     {"file": "xăng dầu.docx", "label": "Cột đo xăng dầu", "ready": False},
 ]
+
+
+def open_in_explorer(path, select_file=False):
+    """Mở file (hoặc thư mục chứa nó) bằng chương trình mặc định của Windows."""
+    path = os.path.normpath(path)
+    try:
+        if select_file and os.path.isfile(path):
+            # mở thư mục và chọn sẵn file vừa tạo
+            subprocess.Popen('explorer /select,"%s"' % path)
+            return True
+        target = path if os.path.isdir(path) else os.path.dirname(path)
+        if select_file:
+            os.startfile(target)
+        else:
+            os.startfile(path)
+        return True
+    except Exception:
+        return False
 
 
 def app_dir():
@@ -613,6 +632,53 @@ def template_field_value(path, key):
     return ""
 
 
+_NOT_A_NAME = ("verified by", "date of issue", "giám đốc", "director",
+               "kiểm định viên", "lào cai", "(*)", "(with")
+
+
+def template_inspector_name(path):
+    """Tên kiểm định viên đang in sẵn trong mẫu (dòng ngay dưới "Verified by").
+
+    Tên nằm một mình trên một dòng, không có nhãn "…:" nên phải dò theo vị
+    trí. Trả về '' nếu không nhận ra."""
+    if not path or not str(path).lower().endswith(".docx"):
+        return ""
+    try:
+        with zipfile.ZipFile(path) as z:
+            root = etree.fromstring(z.read("word/document.xml"))
+    except Exception:
+        return ""
+    seen_marker = False
+    for para, _page in iter_paragraphs_with_page(root):
+        text = para_text(para).strip()
+        if not text:
+            continue
+        low = text.lower()
+        if low.startswith("verified by") or low.startswith("kiểm định viên"):
+            seen_marker = True
+            continue
+        if not seen_marker:
+            continue
+        if len(text) > 40 or any(low.startswith(x) for x in _NOT_A_NAME):
+            continue
+        # dòng chữ ngắn đầu tiên sau "Verified by" chính là tên
+        return text.split("\t")[0].strip()
+    return ""
+
+
+def inspector_field(template_path):
+    """Tạo quy tắc thay tên kiểm định viên cho mẫu đang dùng.
+    Trả về None nếu không đọc được tên trong mẫu."""
+    name = template_inspector_name(template_path)
+    if not name:
+        return None
+    return {
+        "key": "kdv",
+        "display": "Kiểm định viên",
+        "pattern": re.compile(r"(?P<val>%s)" % re.escape(name)),
+    }
+
+
 def template_start_number(path):
     """Số (N°) đang có sẵn trong mẫu — dùng làm số bắt đầu mặc định khi
     khách không nhập gì."""
@@ -726,8 +792,10 @@ def _top_body_child(p, body):
     return a
 
 
-def _scan_part(root, records, apply_mode, is_main, rows, collect_starts=False):
+def _scan_part(root, records, apply_mode, is_main, rows, collect_starts=False,
+               fields=None):
     """Một lượt quét/thay cho một phần XML. Trả về (n_blocks, starts, total)."""
+    fields = fields if fields is not None else FIELDS
     body = root.find(W + "body") if is_main else None
     block = -1
     block_vals = {}
@@ -739,7 +807,7 @@ def _scan_part(root, records, apply_mode, is_main, rows, collect_starts=False):
         full = "".join(t.text or "" for t in ts)
         if not full.strip():
             continue
-        for f in FIELDS:
+        for f in fields:
             m = f["pattern"].search(full)
             if not m:
                 continue
@@ -1040,7 +1108,8 @@ def _trim_extra_pages(root, starts, keep):
     return removed
 
 
-def process_document(b_path, records, out_path=None, exact=False):
+def process_document(b_path, records, out_path=None, exact=False,
+                     extra_field=None):
     """Dò (out_path=None) hoặc thay thế rồi lưu file mới.
 
     - Chia B thành khối/trang theo cấu trúc (textbox, ngắt trang, hoặc gặp
@@ -1052,6 +1121,7 @@ def process_document(b_path, records, out_path=None, exact=False):
     Trả về (rows, total, notes)."""
     if not records:
         raise RuntimeError("Không có bộ dữ liệu nào để thay thế.")
+    fields = FIELDS + [extra_field] if extra_field else FIELDS
     apply_mode = out_path is not None
     replaced_parts = {}
     rows = {}
@@ -1077,14 +1147,14 @@ def process_document(b_path, records, out_path=None, exact=False):
                                  "thành từng trang riêng." % n_split)
                 # lượt dò để biết B có bao nhiêu trang, trang cuối bắt đầu ở đâu
                 orig_blocks, starts, _t = _scan_part(root, records, False,
-                                                     True, None, collect_starts=True)
+                                                     True, None, collect_starts=True, fields=fields)
                 need = len(records) - orig_blocks
                 if orig_blocks > 0 and need > 0 and starts:
                     _clone_last_page(root, starts, need)
                     cloned = True
                     # khối mẫu nhiều trang có thể nhân dôi — cắt phần thừa
                     n2, starts2, _t2 = _scan_part(root, records, False, True,
-                                                  None, collect_starts=True)
+                                                  None, collect_starts=True, fields=fields)
                     if n2 > len(records) and starts2:
                         _trim_extra_pages(root, starts2, len(records))
                 elif exact and need < 0 and starts:
@@ -1110,10 +1180,10 @@ def process_document(b_path, records, out_path=None, exact=False):
                                 and el.get(W + "type") == "page":
                             el.getparent().remove(el)
                             cloned = True
-                n_blocks, _s, t = _scan_part(root, records, apply_mode, True, rows)
+                n_blocks, _s, t = _scan_part(root, records, apply_mode, True, rows, fields=fields)
                 total += t
             else:
-                _b, _s, t = _scan_part(root, records, apply_mode, False, rows)
+                _b, _s, t = _scan_part(root, records, apply_mode, False, rows, fields=fields)
                 total += t
 
             if apply_mode and (t > 0 or cloned):
@@ -1176,6 +1246,9 @@ EXCEL_LABELS = [
     ("che_do", re.compile(r"Chế độ kiểm định\s*:?\s*(?P<val>.*)$")),
     # lấy đúng mã tem, không nuốt phần "Tem NP: ..." ghi cùng dòng
     ("tem", re.compile(r"[Tt]em kiểm định\s*:?\s*(?P<val>\S*)")),
+    # người thực hiện kiểm định (để tuỳ chọn thay tên trên giấy chứng nhận)
+    ("kdv", re.compile(
+        r"^\s*(?:Kiểm định viên|Người thực hiện)\s*:?\s*(?P<val>[^\t\n]*)$")),
     # biên bản taximet: đơn vị quản lý + biển số xe
     ("donvi", re.compile(r"Tên đơn vị quản lý\s*:?\s*(?P<val>.*)$")),
     ("bien_so", re.compile(r"Biển (?:đăng ký|số)\s*xe\s*:?\s*(?P<val>.*)$")),
@@ -1793,6 +1866,37 @@ def run_gui():
     tpl_display = [t["label"] + ("" if t["ready"] else COMING_SOON)
                    for t in tpl_list]
 
+    last_output = {"path": ""}
+
+    def make_open_folder_button(parent):
+        """Nút mở thư mục kết quả, bật lên sau khi tạo file xong."""
+        def do_open():
+            path = last_output["path"]
+            if not path or not os.path.exists(path):
+                messagebox.showwarning("Chưa có kết quả",
+                                       "Chưa tạo file nào trong phiên làm việc này.")
+                return
+            if not open_in_explorer(path, select_file=True):
+                messagebox.showerror("Lỗi", "Không mở được thư mục:\n%s"
+                                     % os.path.dirname(path))
+
+        btn = ttk.Button(parent, text="Mở thư mục kết quả",
+                         command=do_open, state="disabled")
+        btn.pack(side="left", padx=6)
+        return btn
+
+    def finish_and_offer_open(out_path, n_pages, open_button):
+        """Báo xong và hỏi có mở file kết quả ra xem luôn không."""
+        last_output["path"] = out_path
+        if open_button is not None:
+            open_button.config(state="normal")
+        if messagebox.askyesno(
+                "Hoàn tất",
+                "Đã tạo xong %d trang:\n%s\n\nMở file kết quả ngay?"
+                % (n_pages, out_path)):
+            if not open_in_explorer(out_path):
+                messagebox.showerror("Lỗi", "Không mở được file:\n%s" % out_path)
+
     def show_doc_preview(path, title):
         """Cửa sổ xem mẫu: ảnh trang giấy + bảng các trường sẽ thay."""
         try:
@@ -2131,9 +2235,7 @@ def run_gui():
             if notes:
                 msg += "\nLưu ý: " + " ".join(notes)
             status.set(msg)
-            messagebox.showinfo("Hoàn tất",
-                                "Đã tạo file mới:\n%s\n\nSố vị trí đã thay: %d"
-                                % (out_path, total))
+            finish_and_offer_open(out_path, len(records), btn_open1)
 
         start_task(tab1_worker(out_path), on_done, tab1_btns, bar1, status)
 
@@ -2143,6 +2245,7 @@ def run_gui():
                  ttk.Button(btns, text="Bắt đầu thay thế", command=do_replace)]
     for b in tab1_btns:
         b.pack(side="left", padx=6)
+    btn_open1 = make_open_folder_button(btns)
 
     # ================= TAB 2: Excel -> Word =================
     tab2 = ttk.Frame(nb, padding=12)
@@ -2154,6 +2257,7 @@ def run_gui():
     var_dir2 = tk.StringVar()
     var_name2 = tk.StringVar()
     var_start2 = tk.StringVar()
+    var_kdv2 = tk.BooleanVar(value=True)
 
     # mặc định dùng mẫu công tơ 3 pha (dạng hay gặp nhất của luồng Excel)
     _default_tpl = next((t["path"] for t in tpl_list
@@ -2189,6 +2293,11 @@ def run_gui():
     make_row(tab2, 3, "Tên file xuất:", var_name2)
     ent_start2 = make_row(tab2, 4, "Số bắt đầu (N°):", var_start2,
                           hint=SO_GCN_HINT)
+    ttk.Checkbutton(
+        tab2, variable=var_kdv2,
+        text="Cập nhật tên Kiểm định viên theo biên bản "
+             "(bỏ chọn thì giữ tên in sẵn trong mẫu)"
+    ).grid(row=5, column=1, columnspan=2, sticky="w", padx=8, pady=(0, 4))
     ent_start2.set_hint(template_start_number(var_tpl.get()))
 
     # hiển thị sẵn tên mẫu mặc định trên ô chọn
@@ -2198,7 +2307,7 @@ def run_gui():
             break
 
     ttk.Label(tab2, text="Xem trước các trang sẽ tạo:").grid(
-        row=5, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
     cols2 = ("page", "file", "so", "nam", "tem")
     tree2 = ttk.Treeview(tab2, columns=cols2, show="headings", height=9)
     tree2.heading("page", text="Trang")
@@ -2213,13 +2322,13 @@ def run_gui():
     tree2.column("tem", width=110, anchor="w")
     sb2 = ttk.Scrollbar(tab2, orient="vertical", command=tree2.yview)
     tree2.configure(yscrollcommand=sb2.set)
-    tree2.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=4)
-    sb2.grid(row=6, column=3, sticky="ns", pady=4)
-    tab2.rowconfigure(6, weight=1)
+    tree2.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=4)
+    sb2.grid(row=7, column=3, sticky="ns", pady=4)
+    tab2.rowconfigure(7, weight=1)
 
     status2 = tk.StringVar(value="Chọn thư mục Excel và mẫu Word rồi bấm Xem trước.")
     ttk.Label(tab2, textvariable=status2, foreground="#555", wraplength=840,
-              justify="left").grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 2))
+              justify="left").grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 2))
 
     def validate2(need_out=False):
         if not var_folder.get().strip() or not os.path.isdir(var_folder.get()):
@@ -2238,7 +2347,7 @@ def run_gui():
         return True
 
     bar2 = ttk.Progressbar(tab2, mode="determinate")
-    bar2.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+    bar2.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
     def show2(records):
         tree2.delete(*tree2.get_children())
@@ -2249,6 +2358,7 @@ def run_gui():
     def tab2_worker(out_path):
         folder = var_folder.get()
         tpl_input = var_tpl.get()
+        doi_kdv = bool(var_kdv2.get())
         start_no = var_start2.get().strip()
         if start_no == ent_start2.hint_state["hint"]:
             start_no = ""   # khách chưa gõ gì, mới chỉ là chữ gợi ý mờ
@@ -2272,8 +2382,14 @@ def run_gui():
                 tpl = ensure_docx(tpl_input)
                 progress(text="Đang tạo file Word %d trang (bước này có thể mất "
                               "vài phút, xin chờ)..." % len(records))
-                _rows, total, pnotes = process_document(tpl, records,
-                                                        out_path=out_path, exact=True)
+                extra = inspector_field(tpl) if doi_kdv else None
+                if doi_kdv and extra is None:
+                    pnotes.append("Không đọc được tên kiểm định viên in sẵn "
+                                  "trong mẫu — giữ nguyên tên của mẫu")
+                _rows, total, pnotes2 = process_document(
+                    tpl, records, out_path=out_path, exact=True,
+                    extra_field=extra)
+                pnotes.extend(pnotes2)
             else:
                 progress(text="Đang dò mẫu Word phù hợp với dữ liệu...")
                 try:
@@ -2330,18 +2446,22 @@ def run_gui():
             if allnotes:
                 msg += "\nLưu ý: " + " | ".join(allnotes[:6])
             status2.set(msg)
-            messagebox.showinfo("Hoàn tất",
-                                "Đã tạo file:\n%s\n\nSố trang: %d"
-                                % (out_path, len(records)))
+            finish_and_offer_open(out_path, len(records), btn_open2)
 
         start_task(tab2_worker(out_path), on_done, tab2_btns, bar2, status2)
 
     btns2 = ttk.Frame(tab2)
-    btns2.grid(row=9, column=0, columnspan=3, pady=8)
+    btns2.grid(row=10, column=0, columnspan=3, pady=8)
     tab2_btns = [ttk.Button(btns2, text="Xem trước", command=do_preview2),
                  ttk.Button(btns2, text="Bắt đầu tạo", command=do_generate)]
     for b in tab2_btns:
         b.pack(side="left", padx=6)
+    btn_open2 = make_open_folder_button(btns2)
+
+    # Luồng Excel → Word là việc dùng thường xuyên nhất: đưa lên tab đầu và
+    # mở sẵn khi khởi động
+    nb.insert(0, tab2, text="  Excel → Word  ")
+    nb.select(tab2)
 
     root.mainloop()
 
